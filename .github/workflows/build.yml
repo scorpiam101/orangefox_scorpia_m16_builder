@@ -1,0 +1,201 @@
+name: Build OrangeFox Recovery by Scorpia M16
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install twrpdtgen
+        run: |
+          python -m pip install --upgrade pip
+          pip install twrpdtgen
+
+      - name: Extract Device Tree (universal build.prop fallback patch)
+        run: |
+          set -eux
+          python3 - <<'PYEXTRACT'
+          import sys, os
+
+          # ---- Universal in-memory patch ----
+          # Instead of editing the installed library's source (fragile across
+          # versions/formatting), monkeypatch the lookup function itself.
+          # ANY missing build.prop property falls back to a sane default
+          # instead of raising AssertionError - covers ro.product.system.device,
+          # ro.product.first_api_level, ro.bootimage.product.cpu.abilist, and
+          # any other property twrpdtgen/sebaubuntu_libs may ask for, present
+          # or future.
+          from sebaubuntu_libs.libandroid import device_info as _di
+
+          FALLBACK_CODENAME = "spark40"
+          FALLBACK_PROPS = {
+              "ro.product.system.device": FALLBACK_CODENAME,
+              "ro.product.device": FALLBACK_CODENAME,
+              "ro.product.vendor.device": FALLBACK_CODENAME,
+              "ro.product.odm.device": FALLBACK_CODENAME,
+              "ro.product.system.brand": "generic",
+              "ro.product.brand": "generic",
+              "ro.product.system.manufacturer": "unknown",
+              "ro.product.manufacturer": "unknown",
+              "ro.product.system.model": "Unknown Device",
+              "ro.product.model": "Unknown Device",
+              "ro.product.system.name": FALLBACK_CODENAME,
+              "ro.product.name": FALLBACK_CODENAME,
+              "ro.product.board": FALLBACK_CODENAME,
+              "ro.board.platform": FALLBACK_CODENAME,
+              "ro.build.version.release": "13",
+              "ro.build.version.sdk": "33",
+              "ro.build.id": "UNKNOWN",
+              "ro.build.date.utc": "0",
+              "ro.build.type": "user",
+              "ro.build.tags": "release-keys",
+              "ro.product.first_api_level": "33",
+              "ro.product.cpu.abi": "arm64-v8a",
+              "ro.product.cpu.abilist": "arm64-v8a,armeabi-v7a,armeabi",
+              "ro.bootimage.product.cpu.abilist": "arm64-v8a,armeabi-v7a,armeabi",
+          }
+
+          _orig_get_first_prop = _di.DeviceInfo.get_first_prop
+
+          def _patched_get_first_prop(self, props, *args, **kwargs):
+              try:
+                  return _orig_get_first_prop(self, props, *args, **kwargs)
+              except AssertionError:
+                  candidates = props if isinstance(props, (list, tuple)) else [props]
+                  for p in candidates:
+                      if p in FALLBACK_PROPS:
+                          print(f"[patch] {p} missing, using fallback: {FALLBACK_PROPS[p]}")
+                          return FALLBACK_PROPS[p]
+                  print(f"[patch] {candidates} missing, no specific default, using: {FALLBACK_CODENAME}")
+                  return FALLBACK_CODENAME
+
+          _di.DeviceInfo.get_first_prop = _patched_get_first_prop
+          print("[patch] DeviceInfo.get_first_prop patched in-memory for this run")
+
+          image = "vendor_boot.img" if os.path.exists("vendor_boot.img") else "target_image.img"
+          sys.argv = ["twrpdtgen", image]
+
+          try:
+              from twrpdtgen.__main__ import main as twrpdtgen_main
+              twrpdtgen_main()
+          except AssertionError as e:
+              print(f"[FATAL] twrpdtgen failed even with fallbacks applied: {e}")
+              print("[FATAL] This usually means the ramdisk has no build.prop-like file at all -")
+              print("[FATAL] properties may live in system.img/vendor.img instead of boot/vendor_boot.")
+              sys.exit(1)
+          PYEXTRACT
+
+          test -d output
+
+          VENDOR="$(find output -mindepth 1 -maxdepth 1 -type d | head -1 | xargs basename)"
+          CODENAME="$(find "output/$VENDOR" -mindepth 1 -maxdepth 1 -type d | head -1 | xargs basename)"
+
+          test -n "$VENDOR"
+          test -n "$CODENAME"
+
+          echo "VENDOR=$VENDOR" >> "$GITHUB_ENV"
+          echo "CODENAME=$CODENAME" >> "$GITHUB_ENV"
+          echo "DEVICE_PATH=device/$VENDOR/$CODENAME" >> "$GITHUB_ENV"
+
+          mkdir -p device_tree
+          cp -r "output/$VENDOR/$CODENAME/." device_tree/
+
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo apt-get clean
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y             bc bison build-essential ccache curl flex             g++-multilib gcc-multilib git gnupg gperf             imagemagick lib32ncurses5-dev lib32z1-dev             libreadline-dev libsqlite3-dev libssl-dev             libxml2 libxml2-utils lzop pngcrush rsync             schedtool squashfs-tools xsltproc zip zlib1g-dev
+
+      - name: Install repo
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo             -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Sync Recovery Source
+        run: |
+          set -eux
+
+          mkdir -p "$HOME/RecoverySource"
+          cd "$HOME/RecoverySource"
+
+          git config --global user.name "Scorpia M16"
+          git config --global user.email "scorpiam16@build.local"
+
+          repo init -u https://gitlab.com/OrangeFox/Manifest.git -b fox_12.1
+          repo sync -c --no-clone-bundle --no-tags -j2
+
+      - name: Inject Generated Device Tree
+        run: |
+          set -eux
+
+          mkdir -p "$HOME/RecoverySource/$DEVICE_PATH"
+          cp -r device_tree/. "$HOME/RecoverySource/$DEVICE_PATH/"
+
+      - name: Build Recovery
+        run: |
+          set -eux
+
+          cd "$HOME/RecoverySource"
+          source build/envsetup.sh
+
+          export ALLOW_MISSING_DEPENDENCIES=true
+
+          lunch omni_$CODENAME-eng ||           lunch fox_$CODENAME-eng ||           lunch twrp_$CODENAME-eng
+
+          mka vendorbootimage ||           mka recoveryimage ||           mka bootimage
+
+      - name: Package Artifacts
+        run: |
+          set -eux
+
+          OUT="$HOME/RecoverySource/out/target/product/$CODENAME"
+          test -d "$OUT"
+
+          cd "$OUT"
+
+          ZIP="OrangeFox-$CODENAME-ScorpiaM16.zip"
+
+          shopt -s nullglob
+          FILES=( *.img *.zip )
+
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "No build artifacts found."
+            exit 1
+          fi
+
+          zip -j "$ZIP" "${FILES[@]}"
+
+          echo "Created: $OUT/$ZIP"
+
+      - name: Upload Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+
+          cd "$HOME/RecoverySource/out/target/product/$CODENAME"
+
+          TAG_NAME="OrangeFox-ScorpiaM16-$(date +%Y%m%d-%H%M%S)"
+          ZIP="OrangeFox-$CODENAME-ScorpiaM16.zip"
+
+          gh release create "$TAG_NAME" "$ZIP"             --title "OrangeFox Recovery [$CODENAME] - Built by Scorpia M16"             --notes "Automated build created by Scorpia M16 Cloud Pipeline"
