@@ -92,6 +92,42 @@ jobs:
               twrpdtgen_main()
           except AssertionError as e:
               print(f"[FATAL] twrpdtgen failed even with fallbacks applied: {e}")
+              msg = str(e).lower()
+              if "fstab" in msg:
+                  # twrpdtgen (last officially confirmed up to Android 12) only
+                  # looks for fstab in a few fixed spots (etc/recovery.fstab,
+                  # fstab.<hw>, twrp.fstab) at the ramdisk root. On Android 13+
+                  # GKI vendor_boot images, AOSP instead places it nested at
+                  # first_stage_ramdisk/fstab.<hw> - a location this tool never
+                  # checks. Rather than guess, walk everything twrpdtgen's
+                  # bundled AIK extracted and report every fstab-shaped file we
+                  # can actually find, wherever it is, so we know for certain
+                  # whether one exists at all versus is just in the wrong spot.
+                  print("[DIAG] Searching extracted ramdisk/output for any fstab-like files...")
+                  found_any = False
+                  for root, dirs, files in os.walk("."):
+                      # skip huge/irrelevant trees to keep this fast and readable
+                      dirs[:] = [d for d in dirs if d not in (".git",)]
+                      for fname in files:
+                          lname = fname.lower()
+                          if "fstab" in lname:
+                              found_any = True
+                              full = os.path.join(root, fname)
+                              print(f"[DIAG] FOUND: {full}")
+                              try:
+                                  with open(full, "r", errors="replace") as fh:
+                                      head = fh.read(500)
+                                  print(f"[DIAG]   first 500 chars:
+{head}")
+                              except Exception as read_err:
+                                  print(f"[DIAG]   (could not read as text: {read_err})")
+                  if not found_any:
+                      print("[DIAG] No file with 'fstab' in its name was found anywhere under the extracted tree.")
+                      print("[DIAG] This device's fstab genuinely is not packaged in this image's ramdisk -")
+                      print("[DIAG] it likely lives on /vendor or /odm instead, or is DT-embedded with no text file.")
+                      print("[DIAG] Automated device-tree generation cannot proceed from this image alone.")
+                  else:
+                      print("[DIAG] A fstab-like file exists but twrpdtgen didn't use it (wrong location/name for this tool version).")
               print("[FATAL] This usually means the ramdisk has no build.prop-like file at all -")
               print("[FATAL] properties may live in system.img/vendor.img instead of boot/vendor_boot.")
               sys.exit(1)
